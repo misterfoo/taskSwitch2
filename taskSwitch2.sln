@@ -1,6 +1,6 @@
 ﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
-# Visual Studio 2012
+# Visual Studio 2013
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "taskSwitch2", "taskSwitch2.csproj", "{25A31A78-F79F-4D81-93EB-74F84AEC9787}"
 EndProject
 Global

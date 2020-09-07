@@ -1,28 +1,71 @@
-﻿using System;
+﻿using Microsoft.Win32;
+using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Management;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows.Automation;
-using System.Windows.Forms;
+using taskSwitch2.Properties;
 
 namespace taskSwitch2
 {
 	static class WindowTools
 	{
+		public enum ShellHookEvent
+		{
+			WindowCreated = 1,
+			WindowDestroyed = 2,
+			WindowActivated = 4,
+			RudeWindowActivated = 0x8000 | WindowActivated,
+		}
+
+		/// <summary>
+		/// Discards all internal caches for this class.
+		/// </summary>
+		public static void ClearCaches()
+		{
+			s_pidToPath.Clear();
+		}
+
+		/// <summary>
+		/// Registers a shell hook window.
+		/// </summary>
+		public static void RegisterShellHook( IntPtr window, out int windowMsg )
+		{
+			windowMsg = RegisterWindowMessage( "SHELLHOOK" );
+			bool ok = RegisterShellHookWindow( window );
+			if( !ok )
+				throw new System.InvalidOperationException( "Unable to register shell hook window: " + Marshal.GetLastWin32Error() );
+		}
+
+		/// <summary>
+		/// Unregisters a shell hook window.
+		/// </summary>
+		public static void UnregisterShellHook( IntPtr window )
+		{
+			DeregisterShellHookWindow( window );
+		}
+
 		/// <summary>
 		/// Switches to the specified window.
 		/// </summary>
 		public static void SwitchToWindow( IntPtr window )
 		{
-			// passing false for this gives the behavior of Alt+Esc, which sends the current
-			// foreground window to the back
-			// see http://blogs.msdn.com/b/oldnewthing/archive/2011/11/07/10234436.aspx
-			const bool isAltTab = true;
+			// Note: This only works reliably if the uiAccess attribute is True in our manifest,
+			// AND if this application is installed in Program Files. See this page for notes:
+			// https://docs.microsoft.com/en-us/windows/win32/winauto/uiauto-securityoverview
+			if( !SetForegroundWindow( window ) )
+				DebugEvent.Record( "SetForegroundWindow failed: {0}", Marshal.GetLastWin32Error() );
 
-			// Note: this only works reliably if the uiAccess attribute is True in our manifest.
-			SwitchToThisWindow( window, isAltTab );
+			if( IsIconic( window ) )
+				ShowWindow( window, 9 );
 		}
 
 		/// <summary>
@@ -47,21 +90,23 @@ namespace taskSwitch2
 		/// <summary>
 		/// Finds all application windows in Z order, using basic native UI facilities.
 		/// </summary>
-		public static List<IntPtr> FindAppWindowsNative()
+		public static List<IntPtr> FindAppWindowsNative( int maxCount = 0 )
 		{
-			AppWindowEnumerator e = new AppWindowEnumerator();
+			AppWindowEnumerator e = new AppWindowEnumerator( maxCount );
 			EnumWindows( e.ReadWindow, IntPtr.Zero );
 			return e.Windows;
 		}
 
 		/// <summary>
-		/// Gets the names of the taskbar buttons in the order they appear.
+		/// Gets the list of taskbar buttons in the order they appear. This returns cached data
+		/// unless InvalidateWindowInfoCaches has been called.
 		/// </summary>
 		public static List<AutomationElement> GetTaskbarButtonOrder()
 		{
 			AutomationElement taskList = FindExplorerTaskList();
 			if( taskList == null )
 				return new List<AutomationElement>();
+
 			var buttons = new List<AutomationElement>();
 			for( var child = TreeWalker.ControlViewWalker.GetFirstChild( taskList );
 				child != null;
@@ -83,15 +128,30 @@ namespace taskSwitch2
 		}
 
 		/// <summary>
-		/// Gets the path of the executable that owns a window, or an empty string if we can't figure it out.
+		/// Gets the path of the executable that owns a window, or an empty string if we can't
+		/// figure it out. This returns cached info unless InvalidateWindowInfoCaches has been called.
 		/// </summary>
-		public static string GetWindowProcess( IntPtr window )
+		public static string GetWindowProcess( IntPtr window, ConcurrentDictionary<IntPtr, string> cache )
+		{
+			return cache.GetOrAdd( window, ReallyGetWindowProcess );
+		}
+
+		private static readonly ConcurrentDictionary<uint, string> s_pidToPath = new ConcurrentDictionary<uint, string>();
+
+		private static string ReallyGetWindowProcess( IntPtr window )
 		{
 			uint pid;
-			uint tid = GetWindowThreadProcessId( window, out pid );
+			GetWindowThreadProcessId( window, out pid );
+			return s_pidToPath.GetOrAdd( pid, p => GetProcessExeUncached( p ) );
+		}
+
+		private static string GetProcessExeUncached( uint pid )
+		{
 			try
 			{
-				Process proc = Process.GetProcessById( (int)pid );
+				Process proc;
+				using( Utilities.TimedBlock( "Process.GetProcessById" ) )
+					proc = Process.GetProcessById( (int)pid );
 				return proc.MainModule.FileName;
 			}
 			catch( System.ComponentModel.Win32Exception )
@@ -99,6 +159,14 @@ namespace taskSwitch2
 				return string.Empty;
 			}
 			catch( System.UnauthorizedAccessException )
+			{
+				return string.Empty;
+			}
+			catch( System.InvalidOperationException )
+			{
+				return string.Empty;
+			}
+			catch( System.ArgumentException )
 			{
 				return string.Empty;
 			}
@@ -120,55 +188,6 @@ namespace taskSwitch2
 		}
 
 		/// <summary>
-		/// Registers a handler to be called whenever a top-level window is created or destroyed.
-		/// </summary>
-		public static void HookWindowCreateDestroy( Action handler )
-		{
-			Automation.AddAutomationEventHandler( WindowPattern.WindowOpenedEvent,
-				AutomationElement.RootElement, TreeScope.Children, (s, e) => handler() );
-			Automation.AddAutomationEventHandler( WindowPattern.WindowClosedEvent,
-				AutomationElement.RootElement, TreeScope.Subtree, ( s, e ) => handler() );
-		}
-
-		/// <summary>
-		/// Registers a callback to be called when the foreground window changes. Returns an object
-		/// which cleans up the hook registration when Dispose is called.
-		/// </summary>
-		public static IDisposable HookForegroundChange( Action<IntPtr> changeHandler )
-		{
-			WinEventDelegate hookProc = ( IntPtr winEventHook, WinEventType eventType,
-				IntPtr wnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime) =>
-				{
-					if( eventType == WinEventType.ForegroundChange &&
-						idObject == OBJID_WINDOW &&
-						idChild == CHILDID_SELF )
-					{
-						changeHandler( wnd );
-					}
-				};
-
-			HookCleanup cleanup = new HookCleanup();
-			cleanup.m_callback = hookProc;
-			cleanup.m_hook = SetWinEventHook( WinEventType.ForegroundChange, WinEventType.ForegroundChange,
-				IntPtr.Zero, hookProc, 0, 0,
-				(uint)(WinEventFlag.OutOfContext | WinEventFlag.SkipOwnProcess) );
-			return cleanup;
-		}
-
-		private class HookCleanup : IDisposable
-		{
-			// to keep the hook callback alive
-			public WinEventDelegate m_callback;
-
-			public IntPtr m_hook;
-
-			public void Dispose()
-			{
-				UnhookWinEvent( m_hook );
-			}
-		}
-
-		/// <summary>
 		/// Cached task list element; finding this takes significant time, so we don't want to do it
 		/// on every refresh.
 		/// </summary>
@@ -184,13 +203,17 @@ namespace taskSwitch2
 				explorers = Process.GetProcessesByName( "explorer" );
 			foreach( var p in explorers )
 			{
+				string cmdLine = GetCommandLine( p );
+				if( cmdLine != null && cmdLine.Contains( "/factory" ) )
+					continue;
+
 				AutomationElement taskList = root.FindFirst( TreeScope.Descendants, new AndCondition(
 					new PropertyCondition( AutomationElement.ProcessIdProperty, p.Id ),
 					new PropertyCondition( AutomationElement.ClassNameProperty, "MSTaskListWClass" ) ) );
 				if( taskList != null )
 				{
 					p.EnableRaisingEvents = true;
-					p.Exited += (sender, args) => { s_explorerTaskList = null; };
+					p.Exited += ( sender, args ) => { s_explorerTaskList = null; };
 					s_explorerTaskList = taskList;
 					return taskList;
 				}
@@ -198,44 +221,166 @@ namespace taskSwitch2
 			return null;
 		}
 
+		private static string GetCommandLine( Process process )
+		{
+			using( ManagementObjectSearcher searcher = new ManagementObjectSearcher( "SELECT CommandLine FROM Win32_Process WHERE ProcessId = " + process.Id ) )
+			using( ManagementObjectCollection objects = searcher.Get() )
+			{
+				return objects.Cast<ManagementBaseObject>().SingleOrDefault()?["CommandLine"]?.ToString();
+			}
+		}
+
 		/// <summary>
 		/// Gets the icon for a window.
 		/// </summary>
-		public static Icon GetIcon( IntPtr window )
+		public static IDisposable GetIcon( IntPtr window )
 		{
-			IntPtr raw;
+			string text = GetWindowText( window );
+			if( text.Contains( "Snip" ) )
+				Debug.Write( "foo" );
 
-			// Does the window have an icon?
-			const int WmGetIcon = 0x007F;
-			const int IconSmall = 1;
-			const int IconBig = 1;
-			raw = SendMessageSafe( window, WmGetIcon, new IntPtr( IconBig ), IntPtr.Zero, IntPtr.Zero );
-			if( raw != IntPtr.Zero )
-				return Icon.FromHandle( raw );
-			raw = SendMessageSafe( window, WmGetIcon, new IntPtr( IconSmall ), IntPtr.Zero, IntPtr.Zero );
-			if( raw != IntPtr.Zero )
-				return Icon.FromHandle( raw );
-
-			// Does the class have an icon?
-			const int ClassIcon = -14;
-			const int ClassIconSmall = -34;
-			raw = GetClassLong( window, ClassIcon );
-			if( raw != IntPtr.Zero )
-				return Icon.FromHandle( raw );
-			raw = GetClassLong( window, ClassIconSmall );
-			if( raw != IntPtr.Zero )
-				return Icon.FromHandle( raw );
+			// get an icon directly from the window if we can
+			IDisposable icon = GetWindowIcon( window ) ?? GetClassIcon( window );
+			if( icon != null )
+				return icon;
 
 			// does its parent have an icon?
 			IntPtr parent = GetParent( window );
 			if( parent != IntPtr.Zero )
 			{
-				Icon parentIcon = GetIcon( parent );
-				if( parentIcon != null )
-					return parentIcon;
+				icon = GetIcon( parent );
+				if( icon != null )
+					return icon;
 			}
 
+			// try finding it Windows App style
+			icon = GetWindowsAppIconCached( window );
+			if( icon != null )
+				return icon;
+
+			// use a fallback icon
+			return Resources.GenericApp;
+		}
+
+		private static IDisposable GetWindowIcon( IntPtr window )
+		{
+			const int WmGetIcon = 0x007F;
+			const int IconSmall = 1;
+			const int IconBig = 1;
+			IntPtr raw;
+			raw = SendMessageSafe( window, WmGetIcon, new IntPtr( IconSmall ), IntPtr.Zero, IntPtr.Zero );
+			if( raw != IntPtr.Zero )
+				return Icon.FromHandle( raw );
+			raw = SendMessageSafe( window, WmGetIcon, new IntPtr( IconBig ), IntPtr.Zero, IntPtr.Zero );
+			if( raw != IntPtr.Zero )
+				return Icon.FromHandle( raw );
 			return null;
+		}
+
+		private static IDisposable GetClassIcon( IntPtr window )
+		{
+			const int ClassIcon = -14;
+			const int ClassIconSmall = -34;
+			IntPtr raw;
+			raw = GetClassLong( window, ClassIconSmall );
+			if( raw != IntPtr.Zero )
+				return Icon.FromHandle( raw );
+			raw = GetClassLong( window, ClassIcon );
+			if( raw != IntPtr.Zero )
+				return Icon.FromHandle( raw );
+			return null;
+		}
+
+		private static IDisposable GetWindowsAppIconCached( IntPtr window )
+		{
+			// Find the application for this window
+			string exe = ReallyGetWindowProcess( window );
+			if( string.IsNullOrEmpty( exe ) )
+				return null;
+
+			// ApplicationFrameHost.exe is not a real application, but one of its child windows should be
+			// from the real app.
+			if( Regex.IsMatch( exe, "ApplicationFrameHost" ) )
+			{
+				window = GetWindow( window, GetWindowTarget.FirstChild );
+				while( window != IntPtr.Zero && Regex.IsMatch( ReallyGetWindowProcess( window ), "ApplicationFrameHost" ) )
+					window = GetWindow( window, GetWindowTarget.Next );
+				if( window == IntPtr.Zero )
+					return null;
+				exe = ReallyGetWindowProcess( window );
+			}
+
+			// Do we have this exe's icon (including possible lack of one) cached?
+			IDisposable cached;
+			if( m_windowsAppIcon.TryGetValue( exe, out cached ) )
+				return cached;
+
+			// Get the App User Model ID for this thing
+			uint pid;
+			GetWindowThreadProcessId( window, out pid );
+			string package = GetApplicationUserModelId( pid );
+			if( string.IsNullOrEmpty( package ) )
+			{
+				m_windowsAppIcon.TryAdd( exe, null );
+				return null;
+			}
+
+			IDisposable image = GetWindowsAppIcon( package, exe );
+			m_windowsAppIcon.TryAdd( exe, image );
+			return image;
+		}
+
+		private static readonly ConcurrentDictionary<string, IDisposable> m_windowsAppIcon = new ConcurrentDictionary<string, IDisposable>();
+
+		private static IDisposable GetWindowsAppIcon( string package, string exePath )
+		{
+			// Under HKCR are a set of keys named things like AppX2jm25qtmp2qxstv333wv5mne3k5bf4bm, which I don't
+			// know the meaning of, but these keys are directly inked to App User Model IDs and contain paths for
+			// the application icons.
+			RegistryKey k = RegistryKey.OpenBaseKey( RegistryHive.ClassesRoot, RegistryView.Registry64 );
+			RegistryKey info = null;
+			foreach( string subName in k.GetSubKeyNames() )
+			{
+				var sub = k.OpenSubKey( subName, writable: false );
+				var application = sub.OpenSubKey( "Application", writable: false );
+				if( application == null )
+					continue;
+				var appUserModelId = (string)application.GetValue( "AppUserModelID" );
+				if( appUserModelId == package )
+				{
+					info = application;
+					break;
+				}
+			}
+			if( info == null )
+				return null;
+
+			// Find the icon from this registration entry
+			string icon = (string)info.GetValue( "ApplicationIcon" );
+			if( icon == null )
+				return null;
+
+			// Does the icon specify an asset file we can load?
+			var m = Regex.Match( icon, @"ms-resource://([\w\.]+)/Files/(Assets/\w+\.png)" );
+			if( !m.Success )
+				return null;
+
+			// Find the components of the specified file, which will not actually represent a true
+			// file path. From here we have to check for different variants of the image.
+			string rootDir = Path.GetDirectoryName( exePath );
+			string imagePath = Path.Combine( rootDir, m.Groups[2].Value );
+			return LoadImageIfPresent( imagePath, "targetsize-16_contrast-white" ) ??
+				LoadImageIfPresent( imagePath, "contrast-white_targetsize-16" ) ??
+				null;
+		}
+
+		private static IDisposable LoadImageIfPresent( string basePath, string variant )
+		{
+			string maybe = Path.ChangeExtension( basePath, "." + variant + Path.GetExtension( basePath ) );
+			if( !File.Exists( maybe ) )
+				return null;
+
+			return Image.FromFile( maybe );
 		}
 
 		/// <summary>
@@ -243,21 +388,29 @@ namespace taskSwitch2
 		/// </summary>
 		private class AppWindowEnumerator
 		{
-			public AppWindowEnumerator()
+			public AppWindowEnumerator( int maxCount )
 			{
 				this.Windows = new List<IntPtr>();
+				m_maxCount = maxCount;
 			}
 
 			public List<IntPtr> Windows { get; private set; }
 
 			public bool ReadWindow( IntPtr wnd, IntPtr lParam )
 			{
-				if( !IsWindowVisible( wnd ) || IsHungAppWindow( wnd ) )
+				if( !IsWindowVisible( wnd ) )
 					return true;
+
+				// This doesn't seem to matter for behavior/performance, and it's annoying to have "hung" windows not appear in the switcher
+				//if( IsHungAppWindow( wnd ) )
+				//	return true;
+
 				if( IsAppWindow( wnd ) )
 					this.Windows.Add( wnd );
-				return true;
+				return (m_maxCount == 0 || this.Windows.Count < m_maxCount);
 			}
+
+			private int m_maxCount;
 		}
 
 		/// <summary>
@@ -278,10 +431,10 @@ namespace taskSwitch2
 				return false;
 
 			// prune undesirable styles
-			if( 0 != (style & (uint)WindowStyle.Child) ||					// children
+			if( 0 != (style & (uint)WindowStyle.Child) ||                   // children
 				0 == (style & (uint)(WindowStyle.Caption | WindowStyle.SysMenu)) || // windows with no caption or system menu
-				0 != (exStyle & (uint)WindowExStyle.ToolWindow) ||			// tool windows
-				0 != (exStyle & (uint)WindowExStyle.NoActivate) )			// windows that can't be activated
+				0 != (exStyle & (uint)WindowExStyle.ToolWindow) ||          // tool windows
+				0 != (exStyle & (uint)WindowExStyle.NoActivate) )           // windows that can't be activated
 			{
 				return false;
 			}
@@ -300,6 +453,9 @@ namespace taskSwitch2
 
 		[DllImport( "user32.dll" )]
 		private static extern void SwitchToThisWindow( IntPtr wnd, bool isAltTab );
+
+		[DllImport( "user32.dll" )]
+		private static extern IntPtr GetForegroundWindow();
 
 		[DllImport( "user32.dll" )]
 		private static extern bool SetForegroundWindow( IntPtr wnd );
@@ -332,9 +488,9 @@ namespace taskSwitch2
 		[DllImport( "user32.dll" )]
 		static extern int GetWindowLong( IntPtr wnd, WindowLong which );
 
-		[DllImport( "user32.dll" )]
+		[DllImport( "user32.dll", CharSet = CharSet.Unicode )]
 		static extern int GetWindowText( IntPtr wnd, StringBuilder buf, int bufSize );
-		
+
 		[DllImport( "user32.dll" )]
 		static extern IntPtr GetWindow( IntPtr wnd, GetWindowTarget target );
 
@@ -342,6 +498,21 @@ namespace taskSwitch2
 
 		[DllImport( "user32.dll" )]
 		static extern bool EnumWindows( EnumWindowsProc enumProc, IntPtr lParam );
+
+		[DllImport( "user32.dll", SetLastError = true )]
+		private static extern int RegisterWindowMessage( string name );
+
+		[DllImport( "user32", SetLastError = true )]
+		private static extern bool RegisterShellHookWindow( IntPtr hWnd );
+
+		[DllImport( "user32", SetLastError = true )]
+		private static extern int DeregisterShellHookWindow( IntPtr hWnd );
+
+		[DllImport( "user32.dll" )]
+		public static extern bool IsIconic( IntPtr wnd );
+
+		[DllImport( "user32.dll" )]
+		private static extern bool ShowWindow( IntPtr wnd, int cmdShow );
 
 		enum WindowLong : int
 		{
@@ -351,7 +522,9 @@ namespace taskSwitch2
 
 		enum GetWindowTarget
 		{
-			Owner = 4
+			Next = 2,
+			Owner = 4,
+			FirstChild = 5
 		}
 
 		[Flags]
@@ -372,29 +545,47 @@ namespace taskSwitch2
 			NoActivate = 0x08000000,
 		}
 
-		[DllImport( "user32.dll" )]
-		private static extern IntPtr SetWinEventHook( WinEventType eventMin, WinEventType eventMax, IntPtr
-		   hmodWinEventProc, WinEventDelegate winEventProc, uint idProcess,
-		   uint idThread, uint dwFlags );
+		[DllImport( "kernel32.dll", SetLastError = true )]
+		internal static extern Int32 GetApplicationUserModelId(
+			IntPtr hProcess,
+			ref UInt32 AppModelIDLength,
+			[MarshalAs( UnmanagedType.LPWStr )] StringBuilder sbAppUserModelID );
 
-		[DllImport( "user32.dll" )]
-		private static extern bool UnhookWinEvent( IntPtr winEventHook );
+		[DllImport( "kernel32.dll" )]
+		internal static extern IntPtr OpenProcess( int dwDesiredAccess, bool bInheritHandle, uint dwProcessId );
 
-		private delegate void WinEventDelegate( IntPtr winEventHook, WinEventType eventType,
-			IntPtr wnd, int idObject, int idChild, uint dwEventThread, uint dwmsEventTime );
+		[DllImport( "kernel32.dll" )]
+		static extern bool CloseHandle( IntPtr hHandle );
 
-		private enum WinEventFlag : uint
+		private const int ERROR_SUCCESS = 0;
+		private const int ERROR_INSUFFICIENT_BUFFER = 0x7a;
+		private const int QueryLimitedInformation = 0x1000;
+
+		private static string GetApplicationUserModelId( uint pid )
 		{
-			OutOfContext = 0x0000, // Events are ASYNC
-			SkipOwnProcess = 0x0002, // Don't call back for events on installer's process
-		}
+			IntPtr ptrProcess = OpenProcess( QueryLimitedInformation, false, pid );
+			if( IntPtr.Zero == ptrProcess )
+				return null;
 
-		private enum WinEventType : uint
-		{
-			ForegroundChange = 0x0003
-		}
+			string id = null;
+			uint cchLen = 130;
+			StringBuilder sbName = new StringBuilder( (int)cchLen );
+			Int32 lResult = GetApplicationUserModelId( ptrProcess, ref cchLen, sbName );
+			if( ERROR_SUCCESS == lResult )
+			{
+				id = sbName.ToString();
+			}
+			else if( ERROR_INSUFFICIENT_BUFFER == lResult )
+			{
+				sbName = new StringBuilder( (int)cchLen );
+				if( ERROR_SUCCESS == GetApplicationUserModelId( ptrProcess, ref cchLen, sbName ) )
+				{
+					id = sbName.ToString();
+				}
+			}
+			CloseHandle( ptrProcess );
 
-		private const uint OBJID_WINDOW = 0;
-		private const uint CHILDID_SELF = 0;
+			return id;
+		}
 	}
 }

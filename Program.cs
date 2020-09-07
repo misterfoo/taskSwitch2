@@ -41,12 +41,22 @@ namespace taskSwitch2
 		/// <summary>
 		/// The key that should be used to trigger app switching (Alt+[key])
 		/// </summary>
-		public static Keys MainSwitcherKey = Keys.Tab;
+		public static Keys StandardSwitcherKey = Keys.Tab;
+
+		/// <summary>
+		/// The key that should be used to trigger search-as-you-type app switching (Alt+[key])
+		/// </summary>
+		public static Keys TextSearchSwitcherKey = Keys.CapsLock;
 
 		/// <summary>
 		/// Specifies that we are in UI test mode.
 		/// </summary>
 		public static bool UiTestMode;
+
+		/// <summary>
+		/// Specifies that we should not start the background window refresh thread (which makes the debug output quieter)
+		/// </summary>
+		public static bool NoBackgroundRefresh;
 
 		private static bool ParseCommandLine( string[] args )
 		{
@@ -69,8 +79,11 @@ namespace taskSwitch2
 					if( value == string.Empty )
 						return false;
 					const bool ignoreCase = true;
-					if( !Enum.TryParse( value, ignoreCase, out Program.MainSwitcherKey ) )
+					if( !Enum.TryParse( value, ignoreCase, out Program.StandardSwitcherKey ) )
 						return false;
+					break;
+				case "nobackgroundrefresh":
+					Program.NoBackgroundRefresh = true;
 					break;
 				default:
 					return false;

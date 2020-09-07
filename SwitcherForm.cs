@@ -12,7 +12,7 @@ namespace taskSwitch2
 	/// <summary>
 	/// The form which is displayed when switching between applications.
 	/// </summary>
-	public partial class SwitcherForm : Form
+	partial class SwitcherForm : Form
 	{
 		public SwitcherForm()
 		{
@@ -27,21 +27,31 @@ namespace taskSwitch2
 				return;
 			}
 
-			StartRefreshThread();
 			InstallKeyboardHook();
-			InstallAccessibilityHook();
 			InstallTrayIcon();
 			CreateHandle();
+
+			if( !Program.NoBackgroundRefresh )
+				StartRefreshTimer();
+
+			if( Debugger.IsAttached )
+				ShowDebugWindow();
 		}
 
 		private KeyboardHook m_kbHook;
-		private IDisposable m_foregroundChangeHook;
 		private ManualResetEvent m_shutdownEvent = new ManualResetEvent( initialState: false );
-		private AutoResetEvent m_refreshTickleEvent = new AutoResetEvent( initialState: false );
 		private TaskItem m_selectedItem;
 		private bool m_everAdjustedSelection;
 		private TaskGrid m_taskGrid;
+		private int m_shellHookMsg;
 		private Theme m_theme = new Theme();
+		private int m_refreshCount;
+
+		/// <summary>
+		/// If we are in switch-by-typing mode, the string to search for. A value of null indicates
+		/// that we are in regular switching mode.
+		/// </summary>
+		private string m_searchString;
 
 		/// <summary>
 		/// the most recent state we've retrieved
@@ -53,18 +63,44 @@ namespace taskSwitch2
 		/// </summary>
 		private SystemState m_switchState;
 
+		protected override void OnHandleCreated( EventArgs e )
+		{
+			base.OnHandleCreated( e );
+
+			// This allows us to keep track of things that are changing without repeatedly
+			// re-scanning the system state.
+			WindowTools.RegisterShellHook( this.Handle, out m_shellHookMsg );
+		}
+
 		protected override void OnLoad( EventArgs e )
 		{
 			base.OnLoad( e );
 			if( Program.UiTestMode )
-				RefreshTaskGrid();
+				m_state = RebuildTaskGrid();
 		}
 
-		protected override void OnFormClosed( FormClosedEventArgs e )
+		protected override CreateParams CreateParams
 		{
-			base.OnFormClosed( e );
-			if( m_foregroundChangeHook != null )
-				m_foregroundChangeHook.Dispose();
+			get
+			{
+				const int CS_DROPSHADOW = 0x20000;
+				CreateParams cp = base.CreateParams;
+				cp.ClassStyle |= CS_DROPSHADOW;
+				return cp;
+			}
+		}
+
+		protected override void OnClosing( System.ComponentModel.CancelEventArgs e )
+		{
+			WindowTools.UnregisterShellHook( this.Handle );
+			base.OnClosing( e );
+		}
+
+		protected override void WndProc( ref Message m )
+		{
+			if( m.Msg == m_shellHookMsg )
+				HandleShellHook( (WindowTools.ShellHookEvent)m.WParam, m.LParam );
+			base.WndProc( ref m );
 		}
 
 		/// <summary>
@@ -74,12 +110,23 @@ namespace taskSwitch2
 		{
 			if( this.Visible )
 				return;
+
 			m_everAdjustedSelection = false;
-			m_switchState = RefreshTaskGrid();
+			m_searchString = null;
+
+			// Setup the task grid based on the system state
+			DebugEvent.Record( "Switcher opening..." );
+			using( Utilities.TimedBlock( "DisplaySwitcher->RefreshTaskGrid" ) )
+				m_switchState = RebuildTaskGrid();
 			if( m_switchState == null )
 				return;
-			Show();
+
+			// Show the switcher
+			using( Utilities.TimedBlock( "DisplaySwitcher->Show" ) )
+				Show();
+
 			WindowTools.SwitchToWindow( this.Handle );
+			DebugEvent.Record( "Switcher opened" );
 		}
 
 		/// <summary>
@@ -106,12 +153,13 @@ namespace taskSwitch2
 
 		private void CloseSwitcherInternal( bool switchToSelected )
 		{
+			DebugEvent.Record( "Switcher closing..." );
 			if( m_kbHook != null )
 				m_kbHook.SwitcherClosed();
 
 			// If the user is very quick with the keyboard, we may close before registering any
 			// selection changes, and thus never actually switch.
-			if( switchToSelected && !m_everAdjustedSelection )
+			if( switchToSelected && !m_everAdjustedSelection && m_searchString == null )
 				AdjustSelection( 0, 1 );
 
 			if( switchToSelected && m_selectedItem != null )
@@ -124,40 +172,46 @@ namespace taskSwitch2
 				// m_state because the latter may already have been updated by the refresh thread.
 				TaskWindow wnd = m_selectedItem as TaskWindow;
 				if( wnd != null && m_switchState != null )
-				{
-					m_switchState.WindowsByZOrder.Remove( wnd );
-					m_switchState.WindowsByZOrder.Insert( 0, wnd );
-				}
+					m_switchState.NotifyNewForeground( wnd.WindowHandle );
 			}
 
 			m_switchState = null;
 			Hide();
+			DebugEvent.Record( "Switcher closed" );
 		}
 
-		private void OnForegroundChange( IntPtr newForeground )
+		private void HandleShellHook( WindowTools.ShellHookEvent evt, IntPtr window )
 		{
-			// Activating the switcher window is not interesting to us.
-			if( this.IsHandleCreated && newForeground == this.Handle )
+			string text = WindowTools.GetWindowText( window );
+			DebugEvent.Record( $"HandleShellHook->{evt} for {text} ({window:x})" );
+
+			// ignore events related to the switcher itself
+			if( window == this.Handle )
 				return;
-			HandleEnvironmentChange();
-		}
 
-		private void OnWindowCreatedOrDestroyed()
-		{
-			HandleEnvironmentChange();
-		}
+			// major changes should cause us to recompute state entirely
+			if( evt == WindowTools.ShellHookEvent.WindowCreated ||
+				evt == WindowTools.ShellHookEvent.WindowDestroyed )
+			{
+				m_state = null;
+			}
 
-		private void HandleEnvironmentChange()
-		{
-			// we need to refresh our system information
-			m_refreshTickleEvent.Set();
+			// ordering changes can be handled incrementally
+			if( evt == WindowTools.ShellHookEvent.WindowActivated ||
+				evt == WindowTools.ShellHookEvent.RudeWindowActivated )
+			{
+				SystemState state = m_state;
+				if( state != null )
+					state.NotifyNewForeground( window );
+			}
 		}
 
 		/// <summary>
 		/// Handler for responding to input events from the keyboard hook
 		/// </summary>
-		private void PerformSwitch( KeyboardHook.SwitchCommand cmd )
+		private void DoStandardSwitch( KeyboardHook.SwitchCommand cmd )
 		{
+			DebugEvent.Record( "PerformSwitch: {0}", cmd );
 			switch( cmd )
 			{
 			case KeyboardHook.SwitchCommand.SwitchForward:
@@ -167,6 +221,10 @@ namespace taskSwitch2
 			case KeyboardHook.SwitchCommand.SwitchReverse:
 				DisplaySwitcher();
 				AdjustSelection( 0, -1 );
+				break;
+			case KeyboardHook.SwitchCommand.ActivateTypingMode:
+				DisplaySwitcher();
+				SetSearchString( "" );
 				break;
 			case KeyboardHook.SwitchCommand.MoveLeft:
 				AdjustSelection( -1, 0 );
@@ -189,6 +247,31 @@ namespace taskSwitch2
 			}
 		}
 
+		private void DoKeyboardSearch( Keys keys )
+		{
+			if( (keys >= Keys.A && keys <= Keys.Z) ||
+				(keys >= Keys.D0 && keys <= Keys.D9) )
+			{
+				char c = (char)keys;
+				SetSearchString( m_searchString + c );
+			}
+			else if( keys == Keys.Back )
+			{
+				if( m_searchString.Length > 0 )
+					SetSearchString( m_searchString.Substring( 0, m_searchString.Length - 1 ) );
+			}
+		}
+
+		private void SetSearchString( string str )
+		{
+			m_searchString = str.ToLower();
+			m_taskGrid = new TaskGrid( m_state, m_searchString );
+			PositionWindow();
+			m_selectedItem = (m_taskGrid.MruTasks.Length > 0) ? m_taskGrid.MruTasks[0] : null;
+			DebugEvent.Record( $"Selected item is {m_selectedItem?.TaskName}" );
+			Invalidate();
+		}
+
 		/// <summary>
 		/// Keyboard input handler. Note that this is only used on UI Test mode;
 		/// normally our keyboard input comes from the keyboard hook.
@@ -196,21 +279,22 @@ namespace taskSwitch2
 		protected override void OnKeyDown( KeyEventArgs e )
 		{
 			base.OnKeyDown( e );
+			DebugEvent.Record( $"OnKeyDown: {e.KeyCode}" );
 			if( !Program.UiTestMode )
 				return;
 			switch( e.KeyCode )
 			{
 			case Keys.Left:
-				PerformSwitch( KeyboardHook.SwitchCommand.MoveLeft );
+				DoStandardSwitch( KeyboardHook.SwitchCommand.MoveLeft );
 				break;
 			case Keys.Right:
-				PerformSwitch( KeyboardHook.SwitchCommand.MoveRight );
+				DoStandardSwitch( KeyboardHook.SwitchCommand.MoveRight );
 				break;
 			case Keys.Up:
-				PerformSwitch( KeyboardHook.SwitchCommand.MoveUp );
+				DoStandardSwitch( KeyboardHook.SwitchCommand.MoveUp );
 				break;
 			case Keys.Down:
-				PerformSwitch( KeyboardHook.SwitchCommand.MoveDown );
+				DoStandardSwitch( KeyboardHook.SwitchCommand.MoveDown );
 				break;
 			case Keys.Enter:
 				m_selectedItem.SwitchTo();
@@ -219,10 +303,11 @@ namespace taskSwitch2
 				Close();
 				break;
 			case Keys.F5:
-				RefreshTaskGrid();
+				RebuildTaskGrid();
 				Invalidate();
 				break;
 			default:
+				DoKeyboardSearch( e.KeyCode );
 				break;
 			}
 		}
@@ -304,7 +389,7 @@ namespace taskSwitch2
 		/// Computes a new task grid and adjusts the window accordingly. Note that this does not
 		/// refresh the cached system state.
 		/// </summary>
-		private SystemState RefreshTaskGrid()
+		private SystemState RebuildTaskGrid()
 		{
 			SystemState state = m_state;
 			if( state == null )
@@ -315,9 +400,22 @@ namespace taskSwitch2
 				m_state = null;
 				return null;
 			}
-			m_taskGrid = new TaskGrid( state );
+
+			// Setup our window grid
+			m_taskGrid = new TaskGrid( state, m_searchString );
 			m_selectedItem = m_taskGrid.MruTasks[0];
 			PositionWindow();
+
+			// I don't know if this is just an issue with mstsc.exe or something about all full-screen windows,
+			// but if you minimize a full-screen RDP session it stays at the top of the z-order even though it's
+			// not visible. The built-in Windows alt-tab swicher somehow gets around this but Alt+Tab Terminator
+			// sees the same weird view we do. I can't figure out a way around it so we'll just advance past it
+			// when this happens.
+			if( WindowTools.IsIconic( state.WindowsByZOrder[0].WindowHandle ) )
+			{
+				AdjustSelection( 0, 1 );
+			}
+
 			return state;
 		}
 
@@ -361,6 +459,16 @@ namespace taskSwitch2
 					e.Graphics.DrawRectangle( p, area );
 			}
 
+			// draw the search text, if any
+			if( m_searchString != null )
+			{
+				string text = "Seach for: " + m_searchString;
+				e.Graphics.FillRectangle( Brushes.White, m_taskGrid.TextSearchHeader );
+				e.Graphics.DrawRectangle( Pens.Black, m_taskGrid.TextSearchHeader );
+				TextRenderer.DrawText( e.Graphics, text, m_theme.TileText, m_taskGrid.TextSearchHeader,
+					m_theme.TileLabelColor, TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter );
+			}
+
 			// color the MRU area
 			DrawRectangle( e.Graphics, m_taskGrid.MruArea, m_theme.MruBackColor, Color.Transparent, 0 );
 
@@ -385,19 +493,7 @@ namespace taskSwitch2
 			contentArea.Inflate( -Metrics.AppTileInsideGutter, -Metrics.AppTileInsideGutter );
 
 			// draw the window icon
-			Icon icon = GetIcon( task );
-			if( icon != null )
-			{
-				Rectangle iconRect = new Rectangle( contentArea.Location, iconSize );
-				try
-				{
-					g.DrawIcon( icon, iconRect );
-				}
-				catch( System.DivideByZeroException )
-				{
-					// this seems to happen sometimes, and I don't understand why
-				}
-			}
+			DrawWindowIcon( g, task, iconSize, contentArea );
 
 			// draw the window title
 			Rectangle textArea = contentArea;
@@ -406,11 +502,73 @@ namespace taskSwitch2
 			textArea.Width -= textOffset;
 			Color textColor = isSelection ? m_theme.ActiveTileLabelColor : m_theme.TileLabelColor;
 			string text = task.TaskName;
+
+			if( !string.IsNullOrEmpty( m_searchString ) )
+			{
+				HighlightSearchText( g, text, textArea, isSelection );
+			}
+
 			TextRenderer.DrawText( g, text, m_theme.TileText, textArea, textColor,
 				TextFormatFlags.EndEllipsis | TextFormatFlags.VerticalCenter );
 		}
 
-		private Icon GetIcon( TaskItem task )
+		private void DrawWindowIcon( Graphics g, TaskItem task, Size iconSize, Rectangle contentArea )
+		{
+			IDisposable icon = GetIcon( task );
+			Rectangle iconRect = new Rectangle( contentArea.Location, iconSize );
+			if( icon is Icon )
+			{
+				try
+				{
+					g.DrawIcon( (Icon)icon, iconRect );
+				}
+				catch( System.DivideByZeroException )
+				{
+					// this seems to happen sometimes, and I don't understand why
+				}
+			}
+			else if( icon is Image )
+			{
+				try
+				{
+					g.DrawImage( (Image)icon, iconRect );
+				}
+				catch( System.DivideByZeroException )
+				{
+					// this seems to happen sometimes, and I don't understand why
+				}
+			}
+		}
+
+		private void HighlightSearchText( Graphics g, string text, Rectangle textArea, bool isSelection )
+		{
+			// Find where the search text appears in this window's title
+			int index = text.ToLower().IndexOf( m_searchString.ToLower() );
+			CharacterRange[] ranges = new CharacterRange[3];
+			ranges[0].First = 0;
+			ranges[0].Length = index;
+			ranges[1].First = index;
+			ranges[1].Length = m_searchString.Length;
+			ranges[2].First = index + m_searchString.Length;
+			ranges[2].Length = text.Length - ranges[2].First;
+			StringFormat fmt = new StringFormat();
+			fmt.LineAlignment = StringAlignment.Center;
+			fmt.Trimming = StringTrimming.EllipsisCharacter;
+			fmt.SetMeasurableCharacterRanges( ranges );
+
+			// Highlight the search text in the window's title, before drawing it
+			var regions = g.MeasureCharacterRanges( text, m_theme.TileText, textArea, fmt );
+			for( int i = 1; i < 2; i++ )
+			{
+				var boundsf = regions[i].GetBounds( g );
+				Rectangle bounds = new Rectangle(
+					(int)Math.Round( boundsf.Left ), (int)Math.Round( boundsf.Top ),
+					(int)Math.Ceiling( boundsf.Width ), (int)Math.Ceiling( boundsf.Height ) );
+				g.FillRectangle( isSelection ? Brushes.Gray : Brushes.White, boundsf );
+			}
+		}
+
+		private IDisposable GetIcon( TaskItem task )
 		{
 			if( task is TaskWindow )
 			{
@@ -439,37 +597,12 @@ namespace taskSwitch2
 			}
 		}
 
-		private void StartRefreshThread()
-		{
-			var thread = new Thread( StateRefreshThread );
-
-			// this is important for avoiding handle leaks when talking to the UIAutomation framework
-			thread.SetApartmentState( ApartmentState.STA );
-
-			thread.Start();
-		}
-
-		private void StateRefreshThread()
-		{
-			WaitHandle[] handles = new WaitHandle[] { m_shutdownEvent, m_refreshTickleEvent };
-			for(;;)
-			{
-				RefreshSystemState();
-				int wait = WaitHandle.WaitAny( handles, TimeSpan.FromSeconds( 10 ) );
-				if( wait == 0 )
-					return;
-				// we timed out or were tickled
-			}
-		}
-
 		private SystemState RefreshSystemState()
 		{
-			Stopwatch sw = Stopwatch.StartNew();
-			SystemState state = new SystemState();
-			sw.Stop();
-//			Debug.WriteLine( "Computed new system state in {0} ms", sw.ElapsedMilliseconds );
+			SystemState state;
+			using( Utilities.TimedBlock( "DisplaySwitcher->RefreshSystemState" ) )
+				state = new SystemState( m_state );
 			Interlocked.Exchange( ref m_state, state );
-//			Debug.WriteLine( "===> {0} active tasks", state.WindowsByTaskbarOrder.Count );
 			return state;
 		}
 
@@ -480,16 +613,33 @@ namespace taskSwitch2
 			m_kbHook = new KeyboardHook();
 			var thread = new Thread( () =>
 			{
-				m_kbHook.HookSwitcherKey( this, PerformSwitch );
+				m_kbHook.HookSwitcherKey( this, DoStandardSwitch, DoKeyboardSearch );
 				Application.Run();
 			} );
 			thread.Start();
 		}
 
-		private void InstallAccessibilityHook()
+		/// <summary>
+		/// Starts a timer to periodically force a refresh of certain cached information.
+		/// </summary>
+		private void StartRefreshTimer()
 		{
-			m_foregroundChangeHook = WindowTools.HookForegroundChange( OnForegroundChange );
-			WindowTools.HookWindowCreateDestroy( OnWindowCreatedOrDestroyed );
+			var refresh = new System.Windows.Forms.Timer();
+			refresh.Interval = (int)TimeSpan.FromSeconds( 5 ).TotalMilliseconds;
+			refresh.Tick += refreshTimer_Tick;
+			refresh.Start();
+		}
+
+		private void refreshTimer_Tick( object sender, EventArgs e )
+		{
+			// Force a refresh of the various caches by creating a state with no previous state.
+			using( Utilities.TimedBlock( "RefreshTimer-> new SystemState" ) )
+				m_state = new SystemState( lastKnown: null );
+
+			// Occasionally do a more complete refresh.
+			++m_refreshCount;
+			if( m_refreshCount % 10 == 0 )
+				WindowTools.ClearCaches();
 		}
 
 		private void InstallTrayIcon()
@@ -503,12 +653,16 @@ namespace taskSwitch2
 		private void TrayIconThread()
 		{
 			ContextMenuStrip menu = new ContextMenuStrip();
+
+			ToolStripItem debugCmd = menu.Items.Add( "Show &Debug Console" );
+			debugCmd.Click += ( s, a ) => ShowDebugWindow();
+
 			ToolStripItem exitCmd = menu.Items.Add( "E&xit" );
 			exitCmd.Click += ( s, a ) =>
-			{
-				m_shutdownEvent.Set();
-				Application.Exit();
-			};
+				{
+					m_shutdownEvent.Set();
+					Application.Exit();
+				};
 
 			NotifyIcon trayIcon = new NotifyIcon();
 			trayIcon.ContextMenuStrip = menu;
@@ -520,5 +674,14 @@ namespace taskSwitch2
 
 			trayIcon.Visible = false;
 		}
+
+		private void ShowDebugWindow()
+		{
+			if( m_debugWnd == null )
+				m_debugWnd = new DebugInfoWnd();
+			m_debugWnd.Show();
+		}
+
+		private DebugInfoWnd m_debugWnd;
 	}
 }

@@ -1,0 +1,1 @@
+copy $PSScriptRoot\bin\taskSwitch2.exe 'C:\Program Files\TaskSwitch2\'; ii 'C:\Program Files\TaskSwitch2\taskSwitch2.exe'
