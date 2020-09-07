@@ -10,17 +10,17 @@ namespace taskSwitch2
 		/// <summary>
 		/// The icon size we prefer to use.
 		/// </summary>
-		public const int PreferredIconSize = 32;
+		public const int PreferredIconSize = 16;
 
 		/// <summary>
 		/// The amount of space to leave between a tile's icon/text and its outer border.
 		/// </summary>
-		public const int AppTileInsideGutter = 4;
+		public const int AppTileInsideGutter = 5;
 
 		/// <summary>
 		/// The total width to use for app tiles.
 		/// </summary>
-		public const int AppTileWidth = 220;
+		public const int AppTileWidth = 240;
 
 		/// <summary>
 		/// The height of one application tile, in pixels.

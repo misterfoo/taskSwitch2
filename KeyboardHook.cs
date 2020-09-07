@@ -10,11 +10,11 @@ namespace taskSwitch2
 	/// </summary>
 	class KeyboardHook
 	{
-		public void HookSwitcherKey( Control targetWindow, Action<SwitchCommand> onSwitch )
+		public void HookSwitcherKey( Control targetWindow, Action<SwitchCommand> onSwitch, Action<Keys> onKeyboardSearch )
 		{
 			m_targetWindow = targetWindow;
-			m_triggerKey = Program.MainSwitcherKey;
 			m_onSwitch = onSwitch;
+			m_onKeyboardSearch = onKeyboardSearch;
 			InstallHook();
 		}
 
@@ -24,7 +24,7 @@ namespace taskSwitch2
 		/// </summary>
 		public void SwitcherClosed()
 		{
-			m_isSwitching = false;
+			m_switchMode = SwitchMode.None;
 		}
 
 		/// <summary>
@@ -34,6 +34,7 @@ namespace taskSwitch2
 		{
 			SwitchForward,
 			SwitchReverse,
+			ActivateTypingMode,
 			MoveLeft,
 			MoveRight,
 			MoveUp,
@@ -42,10 +43,13 @@ namespace taskSwitch2
 			CancelSwitch,
 		}
 
+		private enum SwitchMode { None, Standard, TypeSearch }
+
 		private Control m_targetWindow;
-		private Keys m_triggerKey;
 		private Action<SwitchCommand> m_onSwitch;
-		private bool m_isSwitching;
+		private Action<Keys> m_onKeyboardSearch;
+		private SwitchMode m_switchMode = SwitchMode.None;
+		private bool m_isShiftPressed; // GetAsyncKeyState is not working for Shift, can't figure out why
 
 		private void InstallHook()
 		{
@@ -72,61 +76,63 @@ namespace taskSwitch2
 			if( 0 != (info.flags & LlkFlags.Injected) )
 				return CallNextHookEx( m_hhook, code, wp, lp );
 
-//			Debug.WriteLine( "vk = {0}, flags = {1}", info.key, info.flags );
+#if DEBUG
+			DebugEvent.Record( "vk = {0}, flags = {1}", info.key, info.flags );
+#endif
 
-			if( info.IsPress )
+			if( info.key == Keys.ShiftKey || info.key == Keys.LShiftKey || info.key == Keys.RShiftKey )
 			{
-				if( info.key == m_triggerKey )
+				m_isShiftPressed = info.IsPress;
+			}
+			else if( info.IsPress )
+			{
+				if( info.key == Program.StandardSwitcherKey )
 				{
-					bool altIsDown = IsPressed( Keys.Menu ) || m_isSwitching;
-					if( altIsDown && IsPressed( Keys.ShiftKey ) )
+					bool altIsDown = IsPressed( Keys.Menu ) || (m_switchMode == SwitchMode.Standard);
+					if( altIsDown && m_isShiftPressed )
 					{
-						m_isSwitching = true;
+						m_switchMode = SwitchMode.Standard;
 						RaiseSwitchCommand( SwitchCommand.SwitchReverse );
 						return 1;
 					}
 					else if( altIsDown )
 					{
-						m_isSwitching = true;
+						m_switchMode = SwitchMode.Standard;
 						RaiseSwitchCommand( SwitchCommand.SwitchForward );
 						return 1;
 					}
 				}
-				else if( m_isSwitching )
+				else if( info.key == Program.TextSearchSwitcherKey )
 				{
-					switch( info.key )
+					if( IsPressed( Keys.Menu ) )
 					{
-					case Keys.Left:
-						RaiseSwitchCommand( SwitchCommand.MoveLeft );
-						return 1;
-					case Keys.Right:
-						RaiseSwitchCommand( SwitchCommand.MoveRight );
-						return 1;
-					case Keys.Up:
-						RaiseSwitchCommand( SwitchCommand.MoveUp );
-						return 1;
-					case Keys.Down:
-						RaiseSwitchCommand( SwitchCommand.MoveDown );
-						return 1;
-					case Keys.Enter:
-						RaiseSwitchCommand( SwitchCommand.CommitSwitch );
-						m_isSwitching = false;
-						return 1;
-					case Keys.Escape:
-						RaiseSwitchCommand( SwitchCommand.CancelSwitch );
-						m_isSwitching = false;
+						m_switchMode = SwitchMode.TypeSearch;
+						RaiseSwitchCommand( SwitchCommand.ActivateTypingMode );
 						return 1;
 					}
+				}
+				else if( m_switchMode == SwitchMode.Standard )
+				{
+					int result = HandleInputForStandard( info );
+					if( result != 0 )
+						return result;
+				}
+				else if( m_switchMode == SwitchMode.TypeSearch )
+				{
+					int result = HandleInputForTypeSearch( info );
+					if( result != 0 )
+						return result;
 				}
 			}
 			else // key up
 			{
 				if( IsMenuKey( info.key ) )
 				{
-					if( m_isSwitching )
+					// lifting Alt in Standard mode commits the switch, but not in TypeSearch mode
+					if( m_switchMode == SwitchMode.Standard )
 					{
 						RaiseSwitchCommand( SwitchCommand.CommitSwitch );
-						m_isSwitching = false;
+						m_switchMode = SwitchMode.None;
 
 						// Originally we were returning here, and thus eating this keystroke. This
 						// confuses some apps (like Visual Studio), so apparently it's the wrong
@@ -135,10 +141,51 @@ namespace taskSwitch2
 				}
 			}
 
-			if( m_isSwitching )
-				return 1; // we swallow all input when switching, so we don't confuse other apps
+			if( m_switchMode == SwitchMode.Standard )
+				return 1; // we swallow all input when doing regular switching, so we don't confuse other apps
 			else
 				return CallNextHookEx( m_hhook, code, wp, lp );
+		}
+
+		private int HandleInputForTypeSearch( KbdLLHookStruct info )
+		{
+			int standard = HandleInputForStandard( info );
+			if( standard != 0 )
+				return standard;
+
+			// All other keyboard input goes direct to the switcher window for review.
+			m_targetWindow.BeginInvoke( new Action( () => m_onKeyboardSearch( info.key ) ) );
+
+			return 1;
+		}
+
+		private int HandleInputForStandard( KbdLLHookStruct info )
+		{
+			switch( info.key )
+			{
+			case Keys.Left:
+				RaiseSwitchCommand( SwitchCommand.MoveLeft );
+				return 1;
+			case Keys.Right:
+				RaiseSwitchCommand( SwitchCommand.MoveRight );
+				return 1;
+			case Keys.Up:
+				RaiseSwitchCommand( SwitchCommand.MoveUp );
+				return 1;
+			case Keys.Down:
+				RaiseSwitchCommand( SwitchCommand.MoveDown );
+				return 1;
+			case Keys.Enter:
+				RaiseSwitchCommand( SwitchCommand.CommitSwitch );
+				m_switchMode = SwitchMode.None;
+				return 1;
+			case Keys.Escape:
+				RaiseSwitchCommand( SwitchCommand.CancelSwitch );
+				m_switchMode = SwitchMode.None;
+				return 1;
+			}
+
+			return 0;
 		}
 
 		private void RaiseSwitchCommand( SwitchCommand cmd )

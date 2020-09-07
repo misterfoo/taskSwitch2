@@ -10,18 +10,18 @@ namespace taskSwitch2
 	{
 		public Theme()
 		{
-			this.BackgroundColor = Color.FromArgb( 246, 246, 246 );
+			this.BackgroundColor = Color.FromArgb( 245, 245, 245 );
 			this.BorderWidth = 1;
 			this.BorderColor = Color.Gray;
 
 			this.MruBackColor = Color.FromArgb( 230, 230, 230 );
 
 			this.TileBorderWidth = 2;
-			this.TileText = new Font( "Calibri", 12 );
+			this.TileText = new Font( "Tahoma", 9 );
 
 			this.ActiveTileBorderColor = Color.RoyalBlue;
-			this.ActiveTileBackColor = Color.White;
-			this.ActiveTileLabelColor = Color.Black;
+			this.ActiveTileBackColor = Color.RoyalBlue;
+			this.ActiveTileLabelColor = Color.White;
 
 			this.TileBorderColor = Color.Transparent;
 			this.TileBackColor = Color.Transparent;

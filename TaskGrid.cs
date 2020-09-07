@@ -18,10 +18,10 @@ namespace taskSwitch2
 			LoadLeftSideColumns();
 		}
 
-		public TaskGrid( SystemState state )
+		public TaskGrid( SystemState state, string textFilter )
 		{
-			PartitionTasks( state );
-			ArrangeElements();
+			PartitionTasks( state, textFilter );
+			ArrangeElements( textFilter );
 		}
 
 		/// <summary>
@@ -30,19 +30,14 @@ namespace taskSwitch2
 		public Size TotalSize { get; private set; }
 
 		/// <summary>
+		/// The area in which to draw the header for switch-by-typing, if applicable.
+		/// </summary>
+		public Rectangle TextSearchHeader { get; private set; }
+
+		/// <summary>
 		/// The area of the MRU tasks.
 		/// </summary>
 		public Rectangle MruArea { get; private set; }
-
-		/// <summary>
-		/// The area of the left side collection of tasks.
-		/// </summary>
-		public Rectangle LeftSideArea { get; private set; }
-
-		/// <summary>
-		/// The area of the right side collection of tasks.
-		/// </summary>
-		public Rectangle RightSideArea { get; private set; }
 
 		/// <summary>
 		/// Gets the grid of tasks in column-major order. Empty grid cells are represented by nulls.
@@ -62,15 +57,51 @@ namespace taskSwitch2
 		/// <summary>
 		/// Splits the current tasks into MRU, left side, and right side.
 		/// </summary>
-		private void PartitionTasks( SystemState state )
+		private void PartitionTasks( SystemState state, string textFilter )
 		{
+			string textFilterLower = textFilter?.ToLower();
 			this.MruTasks = state.WindowsByZOrder
 				.Where( x => WindowTools.IsWindow( x ) )
+				.Where( x => string.IsNullOrEmpty( textFilter ) || x.TaskName.ToLower().Contains( textFilterLower ) )
 				.Take( MruWindowCount )
 				.ToArray();
 
+			// lay out the sides, which are empty if we have a filter
+			List<TaskItem[]> leftSideColumns, rightSideColumns;
+			if( textFilter == null )
+				PartitionLeftAndRightSide( state, out leftSideColumns, out rightSideColumns );
+			else
+				leftSideColumns = rightSideColumns = new List<TaskItem[]>();
+			m_leftSideTasks = leftSideColumns.ToArray();
+			m_rightSideTasks = rightSideColumns.ToArray();
+
+			// build the final grid. the left and right side columns all start with an empty item,
+			// so that the current active task is on a row by itself.
+			List<List<TaskItem>> grid = new List<List<TaskItem>>();
+			leftSideColumns.ForEach( x => grid.Add( new List<TaskItem>( x ) ) );
+			int mruIndex = grid.Count;
+			grid.Add( new List<TaskItem>( this.MruTasks ) );
+			rightSideColumns.ForEach( x => grid.Add( new List<TaskItem>( x ) ) );
+			for( int i = 0; i < grid.Count; i++ )
+			{
+				if( i != mruIndex )
+					grid[i].Insert( 0, null );
+			}
+			this.TasksByColumn = grid.Select( x => x.ToArray() ).ToArray();
+
+			// build the flat task list
+			List<TaskItem> flat = new List<TaskItem>();
+			flat.AddRange( this.MruTasks );
+			leftSideColumns.ForEach( x => flat.AddRange( x ) );
+			rightSideColumns.ForEach( x => flat.AddRange( x ) );
+			this.TasksFlat = flat.ToArray();
+		}
+
+		private void PartitionLeftAndRightSide( SystemState state, out List<TaskItem[]> leftSideColumns, out List<TaskItem[]> rightSideColumns )
+		{
 			// Partition the full set of tasks into left and right sides. 
 			// For the left side the list is Column, then Group, then Task.
+
 			var leftSide = new List<List<List<TaskItem>>>();
 			foreach( var column in m_leftSideColumns )
 			{
@@ -79,6 +110,7 @@ namespace taskSwitch2
 				foreach( var group in column.Groups )
 					groups.Add( new List<TaskItem>() );
 			}
+
 			List<TaskItem> rightSideFlat = new List<TaskItem>();
 			foreach( TaskbarButton btn in state.WindowsByTaskbarOrder )
 			{
@@ -113,38 +145,16 @@ namespace taskSwitch2
 			}
 
 			// split the right side into columns
-			List<TaskItem[]> rightSide = new List<TaskItem[]>();
+			rightSideColumns = new List<TaskItem[]>();
 			IEnumerable<TaskItem> rightRemaining = rightSideFlat;
 			while( rightRemaining.Any() )
 			{
-				rightSide.Add( rightRemaining.Take( MaxRightSideColumnHeight ).ToArray() );
+				rightSideColumns.Add( rightRemaining.Take( MaxRightSideColumnHeight ).ToArray() );
 				rightRemaining = rightRemaining.Skip( MaxRightSideColumnHeight );
 			}
 
-			var leftSideFlat = leftSide.Select( x => MergeLists( x ) ).Where( x => x.Length > 0 ).ToList();
-			m_leftSideTasks = leftSideFlat.ToArray();
-			m_rightSideTasks = rightSide.ToArray();
-
-			// build the final grid. the left and right side columns all start with an empty item,
-			// so that the current active task is on a row by itself.
-			List<List<TaskItem>> grid = new List<List<TaskItem>>();
-			leftSideFlat.ForEach( x => grid.Add( new List<TaskItem>( x ) ) );
-			int mruIndex = grid.Count;
-			grid.Add( new List<TaskItem>( this.MruTasks ) );
-			rightSide.ForEach( x => grid.Add( new List<TaskItem>( x ) ) );
-			for( int i = 0; i < grid.Count; i++ )
-			{
-				if( i != mruIndex )
-					grid[i].Insert( 0, null );
-			}
-			this.TasksByColumn = grid.Select( x => x.ToArray() ).ToArray();
-
-			// build the flat task list
-			List<TaskItem> flat = new List<TaskItem>();
-			flat.AddRange( this.MruTasks );
-			leftSideFlat.ForEach( x => flat.AddRange( x ) );
-			rightSide.ForEach( x => flat.AddRange( x ) );
-			this.TasksFlat = flat.ToArray();
+			// convert the left side temporary form into columns
+			leftSideColumns = leftSide.Select( x => MergeLists( x ) ).Where( x => x.Length > 0 ).ToList();
 		}
 
 		private T[] MergeLists<T>( List<List<T>> lists )
@@ -157,9 +167,9 @@ namespace taskSwitch2
 		/// <summary>
 		/// Initializes the positions of the tasks.
 		/// </summary>
-		private void ArrangeElements()
+		private void ArrangeElements( string textFilter )
 		{
-			int mruHeight = this.MruTasks.Length;
+			int mruHeight = MruWindowCount;
 			mruHeight *= Metrics.AppTileHeight + AppTileBetweenGutter;
 			mruHeight -= AppTileBetweenGutter; // we don't need a gutter after the last one
 
@@ -172,19 +182,36 @@ namespace taskSwitch2
 			Point upperLeft = new Point( OuterGutter, OuterGutter );
 
 			// lay out the left side columns
+			int leftSideWidth;
 			if( m_leftSideTasks.Length > 0 )
-				this.LeftSideArea = ArrangeOneSide( upperLeft, leftSideHeight, m_leftSideTasks );
+				leftSideWidth = ArrangeOneSide( upperLeft, leftSideHeight, m_leftSideTasks );
 			else
-				this.LeftSideArea = new Rectangle();
-			upperLeft.X += this.LeftSideArea.Width;
+				leftSideWidth = MajorAreaGutter * 4; // mainly relevant in TypeSearch mode
+			upperLeft.X += leftSideWidth;
+
+			// leave space for the text search header, which goes just above the MRU area
+			if( textFilter != null )
+			{
+				Point location = upperLeft;
+				location.X += MajorAreaGutter;
+				this.TextSearchHeader = new Rectangle( location,
+					new Size( Metrics.AppTileWidth, Metrics.AppTileHeight ) );
+				int height = this.TextSearchHeader.Height + MajorAreaGutter;
+				upperLeft.Y += height;
+				totalHeight += height;
+			}
 
 			// lay out the MRU list
 			this.MruArea = ArrangeMruList( upperLeft, mruHeight );
 			upperLeft.X += this.MruArea.Width;
 
 			// lay out the right side columns
-			this.RightSideArea = ArrangeOneSide( upperLeft, rightSideHeight, m_rightSideTasks );
-			upperLeft.X += this.RightSideArea.Width;
+			int rightSideWidth;
+			if( m_rightSideTasks.Length > 0 )
+				rightSideWidth = ArrangeOneSide( upperLeft, rightSideHeight, m_rightSideTasks );
+			else
+				rightSideWidth = MajorAreaGutter * 4; // mainly relevant in TypeSearch mode
+			upperLeft.X += rightSideWidth;
 
 			upperLeft.X += OuterGutter;
 
@@ -195,11 +222,13 @@ namespace taskSwitch2
 		{
 			Point startPoint = upperLeft + new Size( MajorAreaGutter, MajorAreaGutter );
 			Point scratchPos = startPoint;
+
 			foreach( TaskItem task in this.MruTasks )
 			{
 				task.Area = new Rectangle( scratchPos, new Size( Metrics.AppTileWidth, Metrics.AppTileHeight ) );
 				scratchPos.Y += task.Area.Height + AppTileBetweenGutter;
 			}
+
 			int totalWidth = Metrics.AppTileWidth + (MajorAreaGutter * 2);
 			totalHeight += (MajorAreaGutter * 2);
 			return new Rectangle( upperLeft, new Size( totalWidth, totalHeight ) );
@@ -220,7 +249,10 @@ namespace taskSwitch2
 			return height;
 		}
 
-		private Rectangle ArrangeOneSide( Point upperLeft, int totalHeight, TaskItem[][] tasks )
+		/// <summary>
+		/// Arranges one side of the switcher display, returning the width of the used area.
+		/// </summary>
+		private int ArrangeOneSide( Point upperLeft, int totalHeight, TaskItem[][] tasks )
 		{
 			Point startPoint = upperLeft + new Size( MajorAreaGutter, MajorAreaGutter );
 			startPoint.Y += Metrics.AppTileHeight + AppTileBetweenGutter; // leave first row blank, for first MRU item
@@ -240,8 +272,7 @@ namespace taskSwitch2
 			}
 			scratchPos.X -= AppTileBetweenGutter;
 			int totalWidth = (scratchPos.X - startPoint.X) + (MajorAreaGutter * 2);
-			totalHeight += (MajorAreaGutter * 2);
-			return new Rectangle( upperLeft, new Size( totalWidth, totalHeight ) );
+			return totalWidth;
 		}
 
 		private static void LoadLeftSideColumns()
@@ -303,12 +334,12 @@ namespace taskSwitch2
 		/// <summary>
 		/// The number of windows to include in the MRU list.
 		/// </summary>
-		private const int MruWindowCount = 11;
+		public const int MruWindowCount = 12;
 
 		/// <summary>
 		/// The maximum number of items to put in one of the right-side columns.
 		/// </summary>
-		private const int MaxRightSideColumnHeight = 9;
+		private const int MaxRightSideColumnHeight = 10;
 
 		/// <summary>
 		/// The size of the gutter around the outer edge.
