@@ -101,3 +101,7 @@ _ReSharper*/
 # Binaries
 *.dll
 *.exe
+
+# Signing bits
+signing/
+
