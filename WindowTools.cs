@@ -128,6 +128,16 @@ namespace taskSwitch2
 		}
 
 		/// <summary>
+		/// Gets the class name for a window.
+		/// </summary>
+		public static string GetWindowClass( IntPtr window )
+		{
+			StringBuilder sb = new StringBuilder( capacity: 256 );
+			GetClassName( window, sb, sb.Capacity );
+			return sb.ToString();
+		}
+
+		/// <summary>
 		/// Gets the path of the executable that owns a window, or an empty string if we can't
 		/// figure it out. This returns cached info unless InvalidateWindowInfoCaches has been called.
 		/// </summary>
@@ -490,6 +500,9 @@ namespace taskSwitch2
 
 		[DllImport( "user32.dll", CharSet = CharSet.Unicode )]
 		static extern int GetWindowText( IntPtr wnd, StringBuilder buf, int bufSize );
+
+		[DllImport( "user32.dll", CharSet = CharSet.Unicode )]
+		static extern int GetClassName( IntPtr wnd, StringBuilder buf, int bufSize );
 
 		[DllImport( "user32.dll" )]
 		static extern IntPtr GetWindow( IntPtr wnd, GetWindowTarget target );

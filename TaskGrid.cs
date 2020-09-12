@@ -126,7 +126,7 @@ namespace taskSwitch2
 					for( int iGroup = 0; iGroup < col.Groups.Count; iGroup++ )
 					{
 						ApplicationGroup group = col.Groups[iGroup];
-						if( group.Pattern.IsMatch( btn.TaskName ) )
+						if( group.IsMatch( btn ) )
 						{
 							List<TaskItem> groupItems = leftSide[iCol][iGroup];
 							if( groupItems.Count == 0 )
@@ -292,8 +292,12 @@ namespace taskSwitch2
 				{
 					ApplicationGroup group = new ApplicationGroup();
 					column.Groups.Add( group );
-					string pattern = xgroup.Element( "pattern" ).Value;
-					group.Pattern = new Regex( pattern, RegexOptions.IgnoreCase );
+					string pattern = xgroup.Element( "titlePattern" )?.Value;
+					if( pattern != null )
+						group.TitlePattern = new Regex( pattern, RegexOptions.IgnoreCase );
+					pattern = xgroup.Element( "classPattern" )?.Value;
+					if( pattern != null )
+						group.ClassPattern = new Regex( pattern, RegexOptions.IgnoreCase );
 				}
 			}
 		}
@@ -316,9 +320,27 @@ namespace taskSwitch2
 		private class ApplicationGroup
 		{
 			/// <summary>
-			/// The pattern that identifies apps in this group.
+			/// The pattern that identifies apps in this group, based on window title.
 			/// </summary>
-			public Regex Pattern { get; set; }
+			public Regex TitlePattern { get; set; }
+
+			/// <summary>
+			/// The pattern that identifies apps in this group, based on window class.
+			/// </summary>
+			public Regex ClassPattern { get; set; }
+
+			public bool IsMatch( TaskbarButton btn )
+			{
+				if( this.TitlePattern != null && this.TitlePattern.IsMatch( btn.TaskName ) )
+					return true;
+
+				string wndClass = btn.WindowClass;
+				if( this.ClassPattern != null && wndClass != null && this.ClassPattern.IsMatch( wndClass ) )
+					return true;
+
+				return false;
+			}
+
 		}
 
 		/// <summary>

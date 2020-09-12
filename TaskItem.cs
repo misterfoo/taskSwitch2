@@ -24,6 +24,11 @@ namespace taskSwitch2
 		private string m_name;
 
 		/// <summary>
+		/// Gets the window class for this task's windows, or null if not available.
+		/// </summary>
+		public abstract string WindowClass { get; }
+
+		/// <summary>
 		/// Stores the rectangle of the task in SwitcherForm client coordinates.
 		/// </summary>
 		public Rectangle Area { get; set; }
@@ -71,60 +76,6 @@ namespace taskSwitch2
 	/// <summary>
 	/// Represents a top-level task window.
 	/// </summary>
-	public class TaskWindowUIA : TaskWindow
-	{
-		public TaskWindowUIA( AutomationElement raw )
-		{
-			m_raw = raw;
-			this.TaskName = DetermineTaskName();
-			this.Icon = WindowTools.GetIcon( this.WindowHandle );
-		}
-
-		private AutomationElement m_raw;
-
-		/// <summary>
-		/// Switches to the window for this task.
-		/// </summary>
-		public override void SwitchTo()
-		{
-			WindowTools.SwitchToWindow( this.WindowHandle );
-		}
-
-		/// <summary>
-		/// Gets the native window handle of the window.
-		/// </summary>
-		public override IntPtr WindowHandle
-		{
-			get { return new IntPtr( m_raw.Current.NativeWindowHandle ); }
-		}
-
-		private string DetermineTaskName()
-		{
-			string name = m_raw.Current.Name;
-
-			// Some apps (notably Cisco Webex) don't set the window text properly for their
-			// top-level windows; instead the window title is just a number (e.g. 30086). For these
-			// we have to dig around and find a TitleBar control. This takes significant time, so we
-			// only do it when absolutely necessary.
-			if( System.Text.RegularExpressions.Regex.IsMatch( name, @"^\d+$" ) )
-				name = FindTitleBar().Current.Name;
-
-			return name;
-		}
-
-		private AutomationElement FindTitleBar()
-		{
-			AutomationElement tb = m_raw.FindFirst( TreeScope.Children,
-				new PropertyCondition( AutomationElement.ControlTypeProperty, ControlType.TitleBar ) );
-			if( tb == null )
-				return m_raw;
-			return tb;
-		}
-	}
-
-	/// <summary>
-	/// Represents a top-level task window.
-	/// </summary>
 	[System.Diagnostics.DebuggerDisplay("{TaskName}")]
 	public class TaskWindowNative : TaskWindow
 	{
@@ -152,6 +103,20 @@ namespace taskSwitch2
 		{
 			get { return m_wnd; }
 		}
+
+		/// <summary>
+		/// Gets our window class.
+		/// </summary>
+		public override string WindowClass
+		{
+			get
+			{
+				if( m_windowClass == null )
+					m_windowClass = WindowTools.GetWindowClass( this.WindowHandle );
+				return m_windowClass;
+			}
+		}
+		private string m_windowClass;
 	}
 
 	/// <summary>
@@ -164,7 +129,12 @@ namespace taskSwitch2
 		{
 			m_raw = raw;
 			string name = m_raw.Current.Name;
+
+			// Starting in Windows 10 (or maybe Windows 8?) the UIA buttons for taskbar items include text
+			// along the lines of " - 42 running windows" in the window text, which confuses the code that
+			// matches windows based on their titles. This code strips off that extra text.
 			name = Regex.Replace( name, @" - \d+ running window(s)?$", "" );
+
 			this.TaskName = name;
 		}
 
@@ -174,6 +144,11 @@ namespace taskSwitch2
 		/// The window we think corresponds to the task.
 		/// </summary>
 		public TaskWindow AssociatedWindow { get; set; }
+
+		/// <summary>
+		/// Gets our window class.
+		/// </summary>
+		public override string WindowClass => this.AssociatedWindow?.WindowClass;
 
 		/// <summary>
 		/// Switches to the window for this task.

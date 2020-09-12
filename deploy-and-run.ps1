@@ -1,1 +1,2 @@
-copy $PSScriptRoot\bin\taskSwitch2.exe 'C:\Program Files\TaskSwitch2\'; ii 'C:\Program Files\TaskSwitch2\taskSwitch2.exe'
+Copy-Item $PSScriptRoot\bin\taskSwitch2.* 'C:\Program Files\TaskSwitch2\' -Verbose
+Invoke-Item 'C:\Program Files\TaskSwitch2\taskSwitch2.exe'
